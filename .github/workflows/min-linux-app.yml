@@ -1,0 +1,112 @@
+# Builds a Linux desktop app (AppImage) of this copy of AFFiNE and publishes it
+# as the GitHub release "min-app", so the newest version is always at:
+# https://github.com/GuldbergPer/AFFiNE/releases/tag/min-app
+name: Min Linux-app
+
+on:
+  push:
+    branches:
+      - canary
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+concurrency:
+  group: min-linux-app
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  # "internal" keeps this app separate from an official AFFiNE install
+  # (own name, own data folder) and turns off the official auto-updater.
+  BUILD_TYPE: internal
+  RELEASE_VERSION: 0.27.5
+  APP_NAME: affine
+  DEBUG: affine:*,napi:*
+
+jobs:
+  web:
+    name: Build web part
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Version
+        uses: ./.github/actions/setup-version
+        with:
+          app-version: ${{ env.RELEASE_VERSION }}
+      - name: Setup Node.js
+        uses: ./.github/actions/setup-node
+      - name: Generate assets
+        run: yarn affine @affine/electron generate-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: desktop-web
+          path: packages/frontend/apps/electron/resources/web-static
+          retention-days: 3
+
+  linux:
+    name: Build Linux app
+    needs: web
+    runs-on: ubuntu-latest
+    env:
+      SKIP_GENERATE_ASSETS: 1
+      AFFINE_UNSIGNED_PACKAGE: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Version
+        uses: ./.github/actions/setup-version
+        with:
+          app-version: ${{ env.RELEASE_VERSION }}
+      - name: Setup Node.js
+        timeout-minutes: 15
+        uses: ./.github/actions/setup-node
+        with:
+          extra-flags: workspaces focus @affine/electron @affine/monorepo @affine/nbstore @toeverything/infra
+          hard-link-nm: false
+          nmHoistingLimits: workspaces
+          enableScripts: true
+      - name: Build AFFiNE native
+        uses: ./.github/actions/build-rust
+        with:
+          target: x86_64-unknown-linux-gnu
+          package: '@affine/native'
+          cache-key: min-linux-app
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-web
+          path: packages/frontend/apps/electron/resources/web-static
+      - name: Build desktop layers
+        run: yarn affine @affine/electron build
+      - name: Free space
+        shell: bash
+        run: |
+          cargo clean
+          rm -rf packages/frontend/apps/electron/node_modules/@affine/nbstore/node_modules/@blocksuite
+          rm -rf packages/frontend/apps/electron/node_modules/@affine/native/node_modules
+      - name: Make AppImage
+        run: yarn affine @affine/electron make --platform=linux --arch=x64 --targets=@reforged/maker-appimage
+        env:
+          SKIP_WEB_BUILD: '1'
+          HOIST_NODE_MODULES: '1'
+          NODE_OPTIONS: --max-old-space-size=14384
+      - name: Collect AppImage
+        shell: bash
+        run: |
+          file=$(find packages/frontend/apps/electron/out -name '*.AppImage' | head -1)
+          test -n "$file"
+          mkdir -p dist-app
+          cp "$file" dist-app/Min-AFFiNE-x86_64.AppImage
+          ls -lh dist-app
+      - name: Publish release "min-app"
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete min-app --yes --cleanup-tag || true
+          gh release create min-app dist-app/Min-AFFiNE-x86_64.AppImage \
+            --target "${{ github.sha }}" \
+            --title "Min AFFiNE (nyeste versjon)" \
+            --notes "Bygget automatisk fra endring ${{ github.sha }}. Last ned Min-AFFiNE-x86_64.AppImage, gjør filen kjørbar og dobbeltklikk."
